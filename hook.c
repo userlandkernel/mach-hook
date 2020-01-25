@@ -1,7 +1,6 @@
 /*
  * Copyright 2020 (c) Sem Voigtländer
 */
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -23,6 +22,7 @@
 
 #include <mach/mach.h>
 
+extern kern_return_t mach_vm_protect(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection);
 extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
 
 uint64_t g_dyldSlide = 0;
@@ -94,6 +94,20 @@ static void *FindImage(mach_port_t task, const char *name)
 	}
 
 	return NULL;
+}
+
+static uint64_t imageSlide(const struct mach_header_64* header) {
+    unsigned long i;
+    const struct segment_command_64 *sgp = (const struct segment_command_64 *)(header + 1);
+    for (i = 0; i < header->ncmds; i++){
+        if (sgp->cmd == LC_SEGMENT_64) {
+            if (sgp->fileoff == 0  &&  sgp->filesize != 0) {
+                return (uint64_t)header - (uint64_t)sgp->vmaddr;
+            }
+        }
+        sgp = (const struct segment_command_64 *)((char *)sgp + sgp->cmdsize);
+    }
+    return 0;
 }
 
 static uint64_t dyldSlide(void) {
@@ -286,12 +300,14 @@ static void* PatchSym(mach_port_t task, void* base, char* symbol, uint64_t newAd
             // Check if its the symbol we are looking for
             if (string_compare(name, symbol) == 0) {
                 printf("Patching '%s' %#llx -> %#llx: ", symbol, nl[i].n_value, newAddr);
-		mach_vm_size_t size = 0;
-		kern_return_t err = mach_vm_read_overwrite(task, (mach_vm_address_t)&nl[i].n_value, sizeof(uint64_t), (mach_vm_address_t)&newAddr, &size);
-		if(err != KERN_SUCCESS) {
-			printf("Failed.\n");
-		} else {
-			printf("Success, patched %llu bytes\n", size);
+                mach_vm_size_t size = 0;
+                kern_return_t err = KERN_SUCCESS;
+                err = mach_vm_protect(task, &nl[i], sizeof(struct nlist_64), TRUE, VM_PROT_DEFAULT);
+                nl[i].n_value = newAddr;
+                if(err != KERN_SUCCESS) {
+                        printf("Failed.\n");
+                } else {
+                    printf("Success, patched %llu bytes\n", size);
                 }
             }
         }
@@ -303,6 +319,90 @@ static void* PatchSym(mach_port_t task, void* base, char* symbol, uint64_t newAd
     
     printf("Failed to find symbol '%s'.\n", symbol);
     
+    return NULL;
+}
+
+
+void* GOTLookup(mach_port_t task, void *base, uint64_t value, uint64_t replacer) {
+    struct segment_command_64 *sc = NULL, *linkedit = NULL, *text = NULL, *data = NULL;
+    struct section_64 *got = NULL, *_text = NULL;
+    struct load_command *lc = NULL;
+    
+    if(!base || !MACH_PORT_VALID(task)) {
+        return NULL;
+    }
+    
+    if( task == mach_task_self() ) {
+        
+        // Point to the first mach-o load command
+        lc = (struct load_command *)(base + sizeof(struct mach_header_64));
+        
+        //Now walk over all load commands
+        for (int i=0; i<((struct mach_header_64 *)base)->ncmds; i++) {
+            
+            sc = (struct segment_command_64 *)lc; // Cast to a segment
+            char * segname = ((struct segment_command_64 *)lc)->segname; // Get its name
+            
+            // Now check if its a segment that we need
+            if (string_compare(segname, "__LINKEDIT") == 0) {
+                linkedit = sc; // Update our reference to linkedit
+            }
+            
+            else if (string_compare(segname, "__TEXT") == 0) {
+                text = sc; // Update our reference to text
+            }
+            
+            else if (string_compare(segname, "__DATA") == 0) {
+                data = sc; // Update our reference to data
+            }
+            
+            // Move on to the next load command
+            lc = (struct load_command *)((unsigned long)lc + lc->cmdsize);
+        }
+        
+        // These segments are required to calculate the file slide
+        if (!linkedit || !text) {
+            return NULL;
+        }
+        
+        // Calculate the file slide
+        unsigned long fileSlide = linkedit->vmaddr - text->vmaddr - linkedit->fileoff;
+    
+        struct section_64* sec = (struct section_64*)((uint64_t)data + sizeof(struct segment_command_64));
+        
+        for (uint32_t j = 0; j < data->nsects; j++) {
+            
+            if(string_compare(sec->sectname, "__got") == 0) {
+                got = sec;
+                break;
+            }
+        }
+        
+        if(!got) {
+            return NULL;
+        }
+        
+        printf("__DATA.%s @ %#llx\n", sec->sectname, sec->addr);
+        for(int i = 0; i < got->size; i+=sizeof(uint64_t)) {
+            uint64_t* valPtr = (void*)(got->addr + i);
+            if(*valPtr == value) {
+                printf("__DATA.__got+%d %#llx -> %#llx\n", i, *valPtr, replacer);
+                *valPtr = replacer;
+                printf("__DATA.__got+%d: %#llx\n", i, *valPtr);
+                return valPtr;
+            }
+            else {
+                if(*valPtr)
+                    printf("__DATA.__got+%d: %#llx\n", i, *valPtr);
+            }
+        }
+        printf("Failed to find value in __GOT\n");
+        return NULL;
+    }
+    else {
+        printf("Remote processes are not supported (yet).\n");
+    }
+    printf("Failed to find __GOT\n");
     return NULL;
 }
 
@@ -385,6 +485,7 @@ int main(int argc, char *argv[]) {
 	void (*my_puts)(char *str);
 	REQUIRE_FWRK("libsystem_c");
 	REQUIRE_SYM(my_puts, "_puts");
+    	GOTLookup(mach_task_self(), fwrkptr, 0x7fff742a4680, 0x4141414141);
 //	my_puts("Hello world from my_puts!\n");
 	PatchSym(mach_task_self(), fwrkptr, "_puts", (uint64_t)my_hook);
 	puts("If you can read this then puts did not get hooked!\n");
