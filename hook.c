@@ -1,6 +1,7 @@
 /*
  * Copyright 2020 (c) Sem Voigtländer
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -15,18 +16,14 @@
 #include <sys/time.h>
 #include <sys/mman.h>
 
-#include <mach-o/dyld_images.h>
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <mach-o/dyld.h>
-
 #include <mach/mach.h>
 
-#include "hook.h"
+#include "exploit.h"
 
-uint64_t g_dyldSlide = 0;
+dyld_slide_t g_dyldSlide = 0;
 
-static inline int string_compare(const char* s1, const char* s2)
+static inline
+int string_compare(const char* s1, const char* s2)
 {
     while (*s1 != '\0' && *s1 == *s2)
     {
@@ -36,6 +33,277 @@ static inline int string_compare(const char* s1, const char* s2)
     return (*(unsigned char *) s1) - (*(unsigned char *) s2);
 }
 
+static inline struct dyld_all_image_infos* task_img_infos(task_t task) {
+    
+    kern_return_t ret = KERN_SUCCESS;
+    
+    struct task_dyld_info dyldInfo = {};
+    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
+    
+    struct dyld_all_image_infos* infos = NULL;
+    
+    if(!MACH_PORT_VALID(task))
+        return NULL;
+
+    
+    ret = task_info(task, TASK_DYLD_INFO, (task_info_t)&dyldInfo, &count);
+    if(ret != KERN_SUCCESS)
+        return NULL;
+    
+    // Get image arrays, size and address
+    infos = (void*)dyldInfo.all_image_info_addr;
+    
+    return infos;
+}
+
+
+static inline dyld_slide_t dyldSlide(void) {
+    
+    struct dyld_all_image_infos* infos = NULL;
+    
+    if(g_dyldSlide)
+        return g_dyldSlide;
+    
+    infos = task_img_infos(mach_task_self());
+    
+    if(!infos) {
+        return 0;
+    }
+    
+    g_dyldSlide = infos->sharedCacheSlide;
+    
+    return g_dyldSlide;
+}
+
+static void MachProcInit(MachoProc proc) {
+    
+    kern_return_t err = KERN_SUCCESS;
+    struct dyld_all_image_infos* infos = NULL;
+    const struct dyld_image_info* image = NULL;
+    
+    proc.m64 = NULL;
+    proc.m32 = NULL;
+    proc.name = NULL;
+    
+    if(!MACH_PORT_VALID(proc.task)) {
+        if(proc.pid == getpid()) {
+            proc.task = mach_task_self();
+        }
+        else {
+            err = task_for_pid(mach_task_self(), proc.pid, &proc.task);
+            if(err != KERN_SUCCESS)
+                return;
+        }
+    }
+    
+    printf("MACH_PROC_INIT\n\n");
+    printf("pid: %d\n", proc.pid);
+    printf("task: %#x\n", proc.task);
+    
+    infos = task_img_infos(proc.task);
+    
+    printf("count: %d images\n", infos->infoArrayCount);
+    
+    // Allocate array with N references to Macho's
+    proc.m64 = malloc(sizeof(Macho64*) * infos->infoArrayCount);
+    proc.m32 = malloc(sizeof(Macho32*) * infos->infoArrayCount);
+    
+    printf("images:\n");
+    for(int i = 0; i < infos->infoArrayCount; ++i) {
+        
+        // Point to the next image
+        image = infos->infoArray + i;
+
+        // Optionally you can print the image path and modification date
+        // That might be useful when you want to verify integrity of dynamic libraries
+        
+        printf("\t%d: %s @ %#llx (%s)\n", i, image->imageFilePath, (uint64_t)image->imageLoadAddress, proc.task == mach_task_self() ? "local" : "remote");
+        
+        // Allocate the actual objects
+        proc.m64[i] = malloc(sizeof(Macho64));
+        proc.m32[i] = malloc(sizeof(Macho32));
+        
+        // Zero out the pointers etc
+        bzero(proc.m64[i], sizeof(Macho64));
+        bzero(proc.m32[i], sizeof(Macho32));
+        
+        if(proc.task == mach_task_self()) {
+            
+            
+            // Point the header to the image addresses
+            proc.m64[i]->hdr = (struct mach_header_64*)image->imageLoadAddress;
+            proc.m32[i]->hdr = (struct mach_header*)image->imageLoadAddress;
+            
+            Macho64* current64 = proc.m64[i];
+            
+            printf("\tmagic: %#x\n", current64->hdr->magic);
+            
+            // Check the magic and wether it'd need to be swapped
+            if(current64->hdr->magic == 0xfeedfacf || current64->hdr->magic == 0xfeedface) {
+                current64->swap = false;
+            }
+            else {
+                current64->swap = false;
+            }
+            
+            // Now check whether its 64-bit or 32-bit
+            
+            
+        }
+        
+        else {
+            
+            // Allocate the header
+            proc.m64[i]->hdr = malloc(sizeof(struct mach_header_64));
+            proc.m32[i]->hdr = malloc(sizeof(struct mach_header));
+            
+            // Now copy the headers from the remote
+            mach_vm_size_t outSize = 0;
+            
+            // First the 32-bit one
+            err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)proc.m32[i]->hdr, sizeof(struct mach_header), (mach_vm_address_t)image->imageLoadAddress, &outSize);
+            
+            if(err != KERN_SUCCESS) {
+                // Optionally print error message
+                return;
+            }
+            
+            // Then the 64-bit one
+            err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)proc.m64[i]->hdr, sizeof(struct mach_header_64), (mach_vm_address_t)image->imageLoadAddress, &outSize);
+            
+            if(err != KERN_SUCCESS) {
+                // Optionally print error message
+                return;
+            }
+            
+            Macho64* current64 = proc.m64[i];
+            
+            printf("\tmagic: %#x\n", current64->hdr->magic);
+            
+            // Check the magic and wether it'd need to be swapped
+            if(current64->hdr->magic == MH_MAGIC_64 || current64->hdr->magic == MH_MAGIC) {
+                current64->swap = false;
+            }
+            else if(current64->hdr->magic == MH_CIGAM_64 || current64->hdr->magic == MH_CIGAM){
+                current64->swap = false;
+            }
+            
+            // Now check whether its 64-bit or 32-bit
+            if(current64->hdr->magic == 0xfeedfacf) {
+                
+                // Lets say its safe to free and nullify the 32-bit version
+                free(proc.m32[i]->hdr);
+                proc.m32[i]->hdr = NULL;
+                bzero(&proc.m32[i], sizeof(Macho32));
+                
+                // Swap endianness if needed
+                if(current64->swap) {
+                    swap_mach_header_64(current64->hdr, 0);
+                }
+                
+                // Allocate array of N references to load commands
+                proc.m64[i]->cmds = malloc(sizeof(struct load_command*) * current64->hdr->ncmds);
+                
+                // Allocate array of N references to segments
+                proc.m64[i]->segs = malloc(sizeof(struct segment_command_64*) * current64->hdr->ncmds);
+                
+                
+                // Zero out the pointers for security reasons
+                bzero(&proc.m64[i]->cmds, sizeof(struct load_command*) * current64->hdr->ncmds);
+                bzero(&proc.m64[i]->segs, sizeof(struct segment_command_64*) * current64->hdr->ncmds);
+                
+                // Point to the load commands in the remote process
+                mach_vm_address_t cmdaddr = (mach_vm_address_t)image->imageLoadAddress + sizeof(struct mach_header_64);
+               
+                struct symtab_command *symtab = malloc(sizeof(struct symtab_command));
+                struct segment_command_64 *LINKEDIT = NULL, *TEXT = NULL, *DATA = NULL;
+                
+                // Go over each load command
+                for(int j = 0, k = 0; j < current64->hdr->ncmds; j++) {
+                    
+                    proc.m64[i]->cmds[j] = malloc(sizeof(struct load_command));
+                    bzero(proc.m64[i]->cmds[j], sizeof(struct load_command));
+                    
+                    // Copy the load command to our process
+                    err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)proc.m64[i]->cmds[j], sizeof(struct load_command), cmdaddr, &outSize);
+                    
+                    if(err != KERN_SUCCESS) {
+                        // Optionally print error message
+                        return;
+                    }
+                    
+                    // Swap endianness if needed
+                    if(current64->swap) {
+                        swap_load_command(proc.m64[i]->cmds[j], 0);
+                    }
+                    
+                    // Check if it's a segment command
+                    if (proc.m64[i]->cmds[j]->cmd == LC_SEGMENT_64) {
+                        
+                        // Allocate a segment command
+                        proc.m64[i]->segs[k] = malloc(sizeof(struct segment_command_64));
+                        bzero(proc.m64[i]->segs[k], sizeof(struct segment_command_64));
+                        
+                        
+                        // Copy the segment command to our process
+                        err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)proc.m64[i]->segs[k], sizeof(struct segment_command_64), cmdaddr, &outSize);
+                        
+                        if(err != KERN_SUCCESS) {
+                            // Optionally print error message
+                            return;
+                        }
+                        
+                        // Swap endianess if needed
+                        if(current64->swap) {
+                            swap_segment_command_64(proc.m64[i]->segs[k], 0);
+                        }
+                        
+                        printf("\tsegment: %s\n", proc.m64[i]->segs[k]->segname);
+                        printf("\t\tcount: %d sections.\n", proc.m64[i]->segs[k]->nsects);
+                        printf("\t\t%#llx - %#llx / %#llx - %#llx prot: %d - %d\n", proc.m64[i]->segs[k]->fileoff, proc.m64[i]->segs[k]->fileoff + proc.m64[i]->segs[k]->filesize, proc.m64[i]->segs[k]->vmaddr, proc.m64[i]->segs[k]->vmaddr + proc.m64[i]->segs[k]->vmsize, proc.m64[i]->segs[k]->initprot, proc.m64[i]->segs[k]->maxprot);
+                        
+                        // Now go over the sections
+                        for(int l = 0; l < proc.m64[i]->segs[k]->nsects; l++) {
+                            
+                        }
+                        
+                        k++; // Increase the segment index counter
+
+                    }
+                    
+                    else if (proc.m64[i]->cmds[j]->cmd == LC_SYMTAB) {
+                        
+                        
+                        
+                        bzero(symtab, sizeof(struct symtab_command));
+                        
+                        // Copy the symtab command to our process
+                        err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)symtab, sizeof(struct symtab_command), cmdaddr, &outSize);
+                        
+                        if(err != KERN_SUCCESS) {
+                            // Optionally print error message
+                            return;
+                        }
+                        
+                        printf("\tsymtab\n");
+                        printf("\t\tcount: %d symbols.\n", symtab->nsyms);
+                        
+                        
+                    }
+                    
+                    cmdaddr += proc.m64[i]->cmds[j]->cmdsize; // Move on to the next load command
+                }
+                
+            }
+        }
+        
+    }
+    
+    
+    
+}
+
+
 /**
  * @brief Retrieves the base address of a loaded mach-o image in the memory
  * @param task Taskport of the process to look in
@@ -43,30 +311,18 @@ static inline int string_compare(const char* s1, const char* s2)
  * @return Base address of the framework or zero
  * @see FindSymbol
  */
-static void *FindImage(mach_port_t task, const char *name)
+static void* FindImage(mach_port_t task, const char *name)
 {
-    kern_return_t ret = KERN_SUCCESS;
-    
-    struct task_dyld_info dyldInfo = {};
-    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
-    
-    struct dyld_all_image_infos* infos = NULL;
-    uint32_t imageCount = 0;
-    
-    struct dyld_image_info* imageArray = NULL;
     
     if(!MACH_PORT_VALID(task)) {
         return NULL;
     }
+    uint32_t imageCount = 0;
+    struct dyld_all_image_infos* infos = NULL;
+    struct dyld_image_info* imageArray = NULL;
+    struct dyld_image_info* image = NULL;
     
-    ret = task_info(task, TASK_DYLD_INFO, (task_info_t)&dyldInfo, &count);
-    if(ret != KERN_SUCCESS) {
-        return NULL;
-    }
-    
-    // Get image arrays, size and address
-    mach_vm_address_t imageInfos = dyldInfo.all_image_info_addr;
-    infos = (void*)imageInfos;
+    infos = task_img_infos(task);
     
     if(!infos) {
         return NULL;
@@ -74,16 +330,15 @@ static void *FindImage(mach_port_t task, const char *name)
     
     imageCount = infos->infoArrayCount;
     imageArray = (void*)infos->infoArray;
-    struct dyld_image_info* image = NULL;
+    
     
     // Foreach image in image array
     for (int i = 0; i < imageCount; ++i) {
         
         image = imageArray + i;
         
-        if(!image) {
+        if(!image)
             break;
-        }
         
         // Check if its the framework We're looking for
         if(strstr(image->imageFilePath, name)) {
@@ -94,6 +349,9 @@ static void *FindImage(mach_port_t task, const char *name)
     
     return NULL;
 }
+
+
+
 
 static uint64_t imageSlide(const struct mach_header_64* header) {
     unsigned long i;
@@ -109,37 +367,6 @@ static uint64_t imageSlide(const struct mach_header_64* header) {
     return 0;
 }
 
-static uint64_t dyldSlide(void) {
-    
-    kern_return_t ret = KERN_SUCCESS;
-    
-    struct task_dyld_info dyldInfo = {};
-    mach_msg_type_number_t count = TASK_DYLD_INFO_COUNT;
-    
-    struct dyld_all_image_infos* infos = NULL;
-    
-    if (g_dyldSlide) {
-        return g_dyldSlide;
-    }
-    
-    ret = task_info(mach_task_self(),TASK_DYLD_INFO, (task_info_t)&dyldInfo, &count);
-    
-    if (ret != KERN_SUCCESS) {
-        return 0;
-    }
-    
-    // Get image array's size and address
-    mach_vm_address_t imageInfos = dyldInfo.all_image_info_addr;
-    infos = (void*)imageInfos;
-    
-    if(!infos) {
-        return 0;
-    }
-    
-    g_dyldSlide = infos->sharedCacheSlide;
-    
-    return infos->sharedCacheSlide;
-}
 
 /**
  * @brief Locates a symbol in the memory by its name in a given framework
@@ -197,7 +424,7 @@ static void* FindSymbol(mach_port_t task, void* base, char* symbol) {
         }
         
         // Calculate the file slide
-        unsigned long fileSlide = linkedit->vmaddr - text->vmaddr - linkedit->fileoff;
+        unsigned long fileSlide = (unsigned long)(linkedit->vmaddr - text->vmaddr - linkedit->fileoff);
         
         // Calculate the string table offset
         strtab = (char *)(base + fileSlide + symtab->stroff);
@@ -282,7 +509,7 @@ static void* PatchSym(mach_port_t task, void* base, char* symbol, uint64_t newAd
         }
         
         // Calculate the file slide
-        unsigned long fileSlide = linkedit->vmaddr - text->vmaddr - linkedit->fileoff;
+        unsigned long fileSlide = (unsigned long)(linkedit->vmaddr - text->vmaddr - linkedit->fileoff);
         
         // Calculate the string table offset
         strtab = (char *)(base + fileSlide + symtab->stroff);
@@ -301,7 +528,7 @@ static void* PatchSym(mach_port_t task, void* base, char* symbol, uint64_t newAd
                 printf("Patching '%s' %#llx -> %#llx: ", symbol, nl[i].n_value, newAddr);
                 mach_vm_size_t size = 0;
                 kern_return_t err = KERN_SUCCESS;
-                err = mach_vm_protect(task, &nl[i], sizeof(struct nlist_64), TRUE, VM_PROT_DEFAULT);
+                err = mach_vm_protect(task, (mach_vm_address_t)&nl[i], sizeof(struct nlist_64), TRUE, VM_PROT_DEFAULT);
                 nl[i].n_value = newAddr;
                 if(err != KERN_SUCCESS) {
                     printf("Failed.\n");
@@ -324,7 +551,7 @@ static void* PatchSym(mach_port_t task, void* base, char* symbol, uint64_t newAd
 
 void* GOTLookup(mach_port_t task, void *base, uint64_t value, uint64_t replacer) {
     struct segment_command_64 *sc = NULL, *linkedit = NULL, *text = NULL, *data = NULL;
-    struct section_64 *got = NULL, *_text = NULL;
+    struct section_64 *got = NULL;
     struct load_command *lc = NULL;
     
     if(!base || !MACH_PORT_VALID(task)) {
@@ -363,9 +590,6 @@ void* GOTLookup(mach_port_t task, void *base, uint64_t value, uint64_t replacer)
         if (!linkedit || !text) {
             return NULL;
         }
-        
-        // Calculate the file slide
-        unsigned long fileSlide = linkedit->vmaddr - text->vmaddr - linkedit->fileoff;
         
         struct section_64* sec = (struct section_64*)((uint64_t)data + sizeof(struct segment_command_64));
         
@@ -404,72 +628,6 @@ void* GOTLookup(mach_port_t task, void *base, uint64_t value, uint64_t replacer)
         printf("Remote processes are not supported (yet).\n");
     }
     printf("Failed to find __GOT\n");
-    return NULL;
-}
-
-void* A64Lookup(mach_port_t task, void* base, struct A64INSTr instructions){
-    struct segment_command_64 *sc = NULL, *linkedit = NULL, *text = NULL, *data = NULL;
-    struct section_64 *got = NULL, *_text = NULL;
-    struct load_command *lc = NULL;
-    
-    if(!base || !MACH_PORT_VALID(task)) {
-        return NULL;
-    }
-    
-    if( task == mach_task_self() ) {
-        
-        // Point to the first mach-o load command
-        lc = (struct load_command *)(base + sizeof(struct mach_header_64));
-        
-        //Now walk over all load commands
-        for (int i=0; i<((struct mach_header_64 *)base)->ncmds; i++) {
-            
-            sc = (struct segment_command_64 *)lc; // Cast to a segment
-            char * segname = ((struct segment_command_64 *)lc)->segname; // Get its name
-            
-            // Now check if its a segment that we need
-            if (string_compare(segname, "__LINKEDIT") == 0) {
-                linkedit = sc; // Update our reference to linkedit
-            }
-            
-            else if (string_compare(segname, "__TEXT") == 0) {
-                text = sc; // Update our reference to text
-            }
-            
-            else if (string_compare(segname, "__DATA") == 0) {
-                data = sc; // Update our reference to data
-            }
-            
-            // Move on to the next load command
-            lc = (struct load_command *)((unsigned long)lc + lc->cmdsize);
-        }
-        
-        // These segments are required to calculate the file slide
-        if (!linkedit || !text) {
-            return NULL;
-        }
-        
-        // Calculate the file slide
-        unsigned long fileSlide = linkedit->vmaddr - text->vmaddr - linkedit->fileoff;
-        
-        struct section_64* sec = (struct section_64*)((uint64_t)text + sizeof(struct segment_command_64));
-        
-        for (uint32_t j = 0; j < data->nsects; j++) {
-            
-            if(string_compare(sec->sectname, "text") == 0) {
-                _text = sec;
-                break;
-            }
-        }
-        
-        if(!_text) {
-            return NULL;
-        }
-        
-        void* ptr = memmem((void*)_text->addr, _text->size, (void*)instructions.instructions, instructions.count * sizeof(uint32_t));
-        return ptr;
-        
-    }
     return NULL;
 }
 
