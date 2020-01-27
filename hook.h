@@ -21,6 +21,14 @@
 #include <mach-o/dyld.h>
 #include <mach-o/swap.h>
 
+#define KERNEL_PID 0
+
+struct thread_command_internal {
+    uint32_t cmd;
+    uint32_t cmdsize;
+    uint32_t flavor;
+    uint32_t count;
+};
 
 typedef struct MachoSym {
     const char *Name;
@@ -28,6 +36,7 @@ typedef struct MachoSym {
 } MachoSym;
 
 typedef struct Macho64 {
+    char *imagePath;
     struct mach_header_64* hdr;
     bool swap;
     struct load_command** cmds;
@@ -73,8 +82,16 @@ typedef struct ROPChain {
 typedef uint64_t dyld_slide_t;
 typedef mach_vm_address_t kern_addr_t;
 typedef mach_vm_address_t uaddr_t;
+typedef void* remote_ptr_t;
 
+extern kern_return_t mach_vm_allocate(vm_map_t target, mach_vm_address_t *address, mach_vm_size_t size, int flags);
+extern kern_return_t mach_vm_deallocate(vm_map_t target, mach_vm_address_t address, mach_vm_size_t size);
 extern kern_return_t mach_vm_protect(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection);
 extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
+extern kern_return_t mach_vm_copy(vm_map_t target_task, mach_vm_address_t source_address, mach_vm_size_t size, mach_vm_address_t dest_address);
+extern kern_return_t mach_vm_behavior_set(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, vm_behavior_t new_behavior);
+extern kern_return_t mach_vm_inherit(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, vm_inherit_t new_inheritance);
+extern kern_return_t mach_vm_read_list(vm_map_t target_task, mach_vm_read_entry_t data_list, natural_t data_count);
+extern kern_return_t mach_vm_write(vm_map_t target, mach_vm_address_t address, vm_offset_t data, mach_msg_type_number_t dataCount);
 
 #endif /* hook_h */
