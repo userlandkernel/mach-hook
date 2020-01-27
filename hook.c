@@ -319,8 +319,12 @@ static kern_return_t MachProcInit(MachoProc proc) {
                         printf("\t\tcount: %d symbols.\n", symtab->nsyms);
                         
                     }
+                    
+                    
                     proc.m64[i]->cmds[j] = lc;
+                    
                     lc = (struct load_command *)((unsigned long)lc + lc->cmdsize);
+                
                 }
                 
             }
@@ -525,18 +529,28 @@ static kern_return_t MachProcInit(MachoProc proc) {
                             continue;
                         }
                         
+                        current64->syms = malloc(sizeof(MachoSym) * symtab->nsyms);
+                        bzero(current64->syms, sizeof(MachoSym) * symtab->nsyms);
+                        
+                        
                         printf("\t\tsymbols:\n");
                         // Walk over the namelists in the symbol table
-                        for (int i=0; i < symtab->nsyms; i++) {
+                        for (int si = 0; si < symtab->nsyms; si++) {
                             
                             // Retrieve the name / string in the current name list
-                            char *namePtr = strtab + nl[i].n_un.n_strx;
+                            char *namePtr = strtab + nl[si].n_un.n_strx;
                             char* name = mach_vm_string(proc.task, namePtr);
-                            if(!name || !nl[i].n_value) {
+                            
+                            if(!name || !nl[si].n_value) {
                                 continue;
                             }
-                           printf("\t\t\t#define %s %#llx\n", name, nl[i].n_value + g_dyldSlide);
+                            
+                            current64->syms[si].Address = nl[si].n_value + dyldSlide();
+                            current64->syms[si].Name = name;
+                            
+                            printf("\t\t\t#define %s %#llx\n", name, nl[si].n_value + dyldSlide());
                         }
+                        printf("\n");
                     }
                     
                     else if (proc.m64[i]->cmds[j]->cmd == LC_UUID) {
@@ -552,6 +566,9 @@ static kern_return_t MachProcInit(MachoProc proc) {
                         if(current64->swap) {
                             swap_uuid_command(&uuid_cmd, 0);
                         }
+                        char uuid[37];
+                        uuid_unparse_lower(uuid_cmd.uuid, uuid);
+                        printf("\tuuid: %s\n",uuid);
                         
                     }
                     
@@ -580,11 +597,60 @@ static kern_return_t MachProcInit(MachoProc proc) {
                             
                         }
                         else if(current64->hdr->cputype == CPU_TYPE_X86_64) {
-                            
-                            
+                        
                             
                         }
                         
+                    }
+                    
+                    else if (proc.m64[i]->cmds[j]->cmd == LC_DYLD_INFO_ONLY) {
+                        struct dyld_info_command dlinfo = {};
+                        mach_vm_size_t read = 0;
+                        err = mach_vm_read_overwrite(mach_task_self(), cmdaddr, sizeof(struct dyld_info_command), (mach_vm_address_t)&dlinfo, &read);
+                        if(err != KERN_SUCCESS) {
+                            continue;
+                        }
+                        printf("\tdyld info: \n");
+                        printf("\t\tbind off: %#x\n",dlinfo.bind_off);
+                        printf("\t\tbind size: %#x\n",dlinfo.bind_size);
+                        printf("\t\texport off: %#x\n",dlinfo.export_off);
+                        printf("\t\texport size: %#x\n",dlinfo.export_size);
+                        printf("\t\tlazy bind off: %#x\n",dlinfo.lazy_bind_off);
+                        printf("\t\tlazy bind size: %#x\n",dlinfo.lazy_bind_size);
+                        printf("\t\trebase off: %#x\n",dlinfo.rebase_off);
+                        printf("\t\trebase size: %#x\n",dlinfo.rebase_size);
+                        printf("\t\tweak bind off: %#x\n",dlinfo.weak_bind_off);
+                        printf("\t\tweak bind size: %#x\n",dlinfo.weak_bind_size);
+                        printf("\n");
+                    }
+                    
+                    else if (proc.m64[i]->cmds[j]->cmd == LC_DYSYMTAB) {
+                        struct dysymtab_command dysymtab = {};
+                        mach_vm_size_t read = 0;
+                        err = mach_vm_read_overwrite(mach_task_self(), cmdaddr, sizeof(struct dysymtab_command), (mach_vm_address_t)&dysymtab, &read);
+                        if(err != KERN_SUCCESS) {
+                            continue;
+                        }
+                        
+                        printf("\tdynamic symbol table: \n");
+                        
+                        printf("\t\textref off: %#x\n", dysymtab.extrefsymoff);
+                        printf("\t\textrel off: %#x\n", dysymtab.extreloff);
+                        printf("\t\tiextdef symbol off: %#x\n", dysymtab.iextdefsym);
+                        printf("\t\tilocal symbol off: %#x\n", dysymtab.ilocalsym);
+                        printf("\t\tindirect symbol off: %#x\n", dysymtab.indirectsymoff);
+                        printf("\t\tiundefined symbol off: %#x\n", dysymtab.iundefsym);
+                        printf("\t\tmodifcation table off: %#x\n", dysymtab.modtaboff);
+                        printf("\t\tnext defined symbol: %d\n", dysymtab.nextdefsym);
+                        printf("\t\tnext referenced symbols: %d\n", dysymtab.nextrefsyms);
+                        printf("\t\tnext relative: %d\n", dysymtab.nextrel);
+                        printf("\t\tindeirect symbol count: %d\n", dysymtab.nindirectsyms);
+                        printf("\t\tlocal symbol count: %d\n", dysymtab.nlocalsym);
+                        printf("\t\tlocal relative count: %d\n", dysymtab.nlocrel);
+                        printf("\t\tmodification table count: %d\n", dysymtab.nmodtab);
+                        printf("\t\ttable of contents count: %d\n", dysymtab.ntoc);
+                        printf("\t\tnumber of undefined symbols: %d\n", dysymtab.nundefsym);
+                        printf("\t\ttable of contents off: %#x\n", dysymtab.tocoff);
                     }
                     
                     cmdaddr = cmdaddr + proc.m64[i]->cmds[j]->cmdsize; // Move on to the next load command
