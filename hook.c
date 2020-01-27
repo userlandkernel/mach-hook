@@ -15,8 +15,10 @@
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/mman.h>
+#include <uuid/uuid.h>
 
 #include <mach/mach.h>
+#include <mach/thread_status.h>
 
 #include "hook.h"
 
@@ -33,6 +35,10 @@ int string_compare(const char* s1, const char* s2)
     return (*(unsigned char *) s1) - (*(unsigned char *) s2);
 }
 
+/*
+ * @brief This function will return information about the loaded images in a task.
+ * @brief It may be used to iterate over loaded frameworks and libraries or to retrieve the dyld cache slide
+*/
 static inline struct dyld_all_image_infos* task_img_infos(task_t task) {
     
     kern_return_t ret = KERN_SUCCESS;
@@ -76,7 +82,9 @@ static inline struct dyld_all_image_infos* task_img_infos(task_t task) {
     return infos;
 }
 
-
+/*
+ * @brief This function will retrieve the dyld shared cache slide
+ */
 static inline dyld_slide_t dyldSlide(void) {
     
     struct dyld_all_image_infos* infos = NULL;
@@ -124,7 +132,21 @@ char* mach_vm_string(task_t task, char* remotePtr) {
     return localstr;
 }
 
-static void MachProcInit(MachoProc proc) {
+remote_ptr_t remote_alloc(task_t task, mach_vm_size_t size) {
+    mach_vm_address_t addr = 0;
+    kern_return_t err = KERN_SUCCESS;
+    err = mach_vm_allocate(task, &addr, size, VM_PROT_READ|VM_PROT_WRITE);
+    return (remote_ptr_t)addr;
+}
+
+kern_return_t remote_free(task_t task, mach_vm_size_t size) {
+    mach_vm_address_t addr = 0;
+    kern_return_t err = KERN_SUCCESS;
+    err = mach_vm_deallocate(task, addr, size);
+    return err;
+}
+
+static kern_return_t MachProcInit(MachoProc proc) {
 
     kern_return_t err = KERN_SUCCESS;
     struct dyld_all_image_infos* infos = NULL;
@@ -143,17 +165,30 @@ static void MachProcInit(MachoProc proc) {
         else {
             err = task_for_pid(mach_task_self(), proc.pid, &proc.task);
             if(err != KERN_SUCCESS) {
-                fprintf(stderr, "task_for_pid(%d) failed.\n", proc.pid);
-                return;
+                
+                // Try HSP4 for kernel
+                if(proc.pid == KERNEL_PID) {
+                    err = host_get_special_port(mach_host_self(), HOST_LOCAL_NODE, 4, &proc.task);
+                }
+                
+                if(err != KERN_SUCCESS || !MACH_PORT_VALID(proc.task)) {
+                    
+                    if(err == KERN_SUCCESS)
+                        err = KERN_INVALID_TASK;
+                    
+                    fprintf(stderr, "task_for_pid(%d)/hsp(4) failed, are you root / holding task-for_pid entitlement? err = %s\n", proc.pid, mach_error_string(err));
+                    
+                    return err;
+                }
             }
-            
         }
     }
 
+    // And here the magic begins
     printf("MACH_PROC_INIT\n");
     printf("\tpid: %d\n", proc.pid);
     printf("\ttask: %#x\n", proc.task);
-
+    
     infos = task_img_infos(proc.task);
 
     if(!infos) {
@@ -169,7 +204,7 @@ static void MachProcInit(MachoProc proc) {
     
     printf("\timages:\n\n");
     for(int i = 0; i < infos->infoArrayCount; ++i) {
-        
+        char* imageFilePath = NULL;
         // Point to the next image
         if(proc.task == mach_task_self()) {
             image = (struct dyld_image_info*)((unsigned long)infos->infoArray + i);
@@ -183,23 +218,21 @@ static void MachProcInit(MachoProc proc) {
                 fprintf(stderr, "\tfailed reading image info from remote process: %s.\n", mach_error_string(err));
                 free(image);
                 image = NULL;
-                return;
+                return err;
             }
         }
 
         // Optionally you can print the image path and modification date
         // That might be useful when you want to verify integrity of dynamic libraries
         if(proc.task == mach_task_self()) {
-            printf("image #%d:\n\tPath: %s\n\tBase address: %#llx (local)\n", i, image->imageFilePath, (uint64_t)image->imageLoadAddress);
+            printf("image #%d:\n\n\tPath: %s\n\tBase address: %#llx (local)\n", i, image->imageFilePath, (uint64_t)image->imageLoadAddress);
         }
         else {
-            char* imageFilePath = mach_vm_string(proc.task, (char*)image->imageFilePath);
+             imageFilePath = mach_vm_string(proc.task, (char*)image->imageFilePath);
             if(!imageFilePath) {
-                printf("image #%d:\n\tPath: %s\n\tBase address: %#llx (remote)\n", i, "unknown", (uint64_t)image->imageLoadAddress);
+                printf("image #%d:\n\n\tPath: %s\n\tBase address: %#llx (remote)\n", i, "unknown", (uint64_t)image->imageLoadAddress);
             } else {
-                printf("image #%d:\n\tPath: %s\n\tBase address: %#llx (remote)\n", i, imageFilePath, (uint64_t)image->imageLoadAddress);
-                free(imageFilePath); // FREE!!!
-                imageFilePath = NULL;
+                printf("image #%d:\n\n\tPath: %s\n\tBase address: %#llx (remote)\n", i, imageFilePath, (uint64_t)image->imageLoadAddress);
             }
         }
         
@@ -211,6 +244,9 @@ static void MachProcInit(MachoProc proc) {
         bzero(proc.m64[i], sizeof(Macho64));
         bzero(proc.m32[i], sizeof(Macho32));
         
+        if(i == 0)
+            proc.m64[i]->imagePath = imageFilePath;
+        
         if(proc.task == mach_task_self()) {
             
             // Point the header to the image addresses
@@ -219,7 +255,7 @@ static void MachProcInit(MachoProc proc) {
             
             current64 = proc.m64[i];
             
-            printf("\t\tmagic: %#x\n", current64->hdr->magic);
+            printf("\tmagic: %#x\n", current64->hdr->magic);
             
             // Check the magic and wether it'd need to be swapped
             if(current64->hdr->magic == 0xfeedfacf || current64->hdr->magic == 0xfeedface) {
@@ -229,7 +265,7 @@ static void MachProcInit(MachoProc proc) {
                 current64->swap = false;
             }
             
-            printf("\t\tendian: %s\n", current64->swap ? "little" : "big");
+            printf("\tendian: %s\n", current64->swap ? "little" : "big");
             
             // Now check whether its 64-bit or 32-bit
             if(current64->hdr->magic == 0xfeedfacf) {
@@ -305,7 +341,7 @@ static void MachProcInit(MachoProc proc) {
             
             if(err != KERN_SUCCESS) {
                 // Optionally print error message
-                return;
+                return err;
             }
             
             // Then the 64-bit one
@@ -313,12 +349,13 @@ static void MachProcInit(MachoProc proc) {
             
             if(err != KERN_SUCCESS) {
                 // Optionally print error message
-                return;
+                return err;
             }
             
             current64 = proc.m64[i];
             
-            printf("\t\tmagic: %#x\n", current64->hdr->magic);
+            printf("\tmagic: %#x\n", current64->hdr->magic);
+            
             
             // Check the magic and wether it'd need to be swapped
             if(current64->hdr->magic == MH_MAGIC_64 || current64->hdr->magic == MH_MAGIC) {
@@ -327,6 +364,8 @@ static void MachProcInit(MachoProc proc) {
             else if(current64->hdr->magic == MH_CIGAM_64 || current64->hdr->magic == MH_CIGAM){
                 current64->swap = false;
             }
+            
+            printf("\tendian: %s\n\n", current64->swap ? "little" : "big");
             
             // Now check whether its 64-bit or 32-bit
             if(current64->hdr->magic == 0xfeedfacf) {
@@ -369,7 +408,7 @@ static void MachProcInit(MachoProc proc) {
                     
                     if(err != KERN_SUCCESS) {
                         fprintf(stderr, "Failed reading load command from remote process: %s\n", mach_error_string(err));
-                        return;
+                        return err;
                     }
                     
                     // Swap endianness if needed
@@ -390,7 +429,7 @@ static void MachProcInit(MachoProc proc) {
                         
                         if(err != KERN_SUCCESS) {
                             // Optionally print error message
-                            return;
+                            return err;
                         }
                         
                         // Swap endianess if needed
@@ -400,7 +439,7 @@ static void MachProcInit(MachoProc proc) {
                         
                         printf("\tsegment: %s\n", proc.m64[i]->segs[k]->segname);
                         printf("\t\tcount: %d sections.\n", proc.m64[i]->segs[k]->nsects);
-                        printf("\t\t%#llx - %#llx / %#llx - %#llx prot: %d - %d\n", proc.m64[i]->segs[k]->fileoff, proc.m64[i]->segs[k]->fileoff + proc.m64[i]->segs[k]->filesize, proc.m64[i]->segs[k]->vmaddr, proc.m64[i]->segs[k]->vmaddr + proc.m64[i]->segs[k]->vmsize, proc.m64[i]->segs[k]->initprot, proc.m64[i]->segs[k]->maxprot);
+                        printf("\t\tmap: %#llx - %#llx / %#llx - %#llx prot: %d - %d\n", proc.m64[i]->segs[k]->fileoff, proc.m64[i]->segs[k]->fileoff + proc.m64[i]->segs[k]->filesize, proc.m64[i]->segs[k]->vmaddr, proc.m64[i]->segs[k]->vmaddr + proc.m64[i]->segs[k]->vmsize, proc.m64[i]->segs[k]->initprot, proc.m64[i]->segs[k]->maxprot);
                         
                         
                         if(string_compare("__DATA", proc.m64[i]->segs[k]->segname) == 0) {
@@ -416,12 +455,26 @@ static void MachProcInit(MachoProc proc) {
                             TEXT_EXEC = proc.m64[i]->segs[k];
                         }
                         
-                        // Now go over the sections
-                        for(int l = 0; l < proc.m64[i]->segs[k]->nsects; l++) {
+                        mach_vm_size_t read = 0;
+                        struct section_64 section[proc.m64[i]->segs[k]->nsects];
+                        err = mach_vm_read_overwrite(proc.task, cmdaddr + sizeof(struct segment_command_64), sizeof(struct section_64) * proc.m64[i]->segs[k]->nsects, (mach_vm_address_t)section, &read);
+                        if(err != KERN_SUCCESS) {
+                          
+                        }
+                        else {
                             
+                            if(current64->swap) {
+                                swap_section_64(section, proc.m64[i]->segs[k]->nsects, 0);
+                            }
+                            
+                            // Now go over the sections
+                            for(int l = 0; l < proc.m64[i]->segs[k]->nsects; l++) {
+                                printf("\t\tsection: %s\n", section[l].sectname);
+                            }
                         }
                         
                         k++; // Increase the segment index counter
+                        printf("\n");
 
                     }
                     
@@ -434,7 +487,7 @@ static void MachProcInit(MachoProc proc) {
                         
                         if(err != KERN_SUCCESS) {
                             // Optionally print error message
-                            return;
+                            return err;
                         }
                         
                         printf("\tsymtab:\n");
@@ -486,16 +539,64 @@ static void MachProcInit(MachoProc proc) {
                         }
                     }
                     
+                    else if (proc.m64[i]->cmds[j]->cmd == LC_UUID) {
+                        
+                        struct uuid_command uuid_cmd = {}; // Stack seemed better in the end
+                        mach_vm_size_t read = 0;
+                        
+                        err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)proc.m64[i]->cmds[j], sizeof(struct uuid_command), (mach_vm_address_t)&uuid_cmd, &read);
+                        if(err != KERN_SUCCESS) {
+                            continue;
+                        }
+                        
+                        if(current64->swap) {
+                            swap_uuid_command(&uuid_cmd, 0);
+                        }
+                        
+                    }
+                    
+                    else if (proc.m64[i]->cmds[j]->cmd == LC_CODE_SIGNATURE) {
+                        
+                    }
+                    
+                    else if (proc.m64[i]->cmds[j]->cmd == LC_MAIN) {
+                        
+                    }
+                    
+                    else if (proc.m64[i]->cmds[j]->cmd == LC_UNIXTHREAD || proc.m64[i]->cmds[j]->cmd == LC_THREAD) {
+                        
+                        struct thread_command_internal thread = {};
+                        mach_vm_size_t read = 0;
+                        
+                        err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)proc.m64[i]->cmds[j], sizeof(struct uuid_command), (mach_vm_address_t)&thread, &read);
+                        if(err != KERN_SUCCESS) {
+                            continue;
+                        }
+                        
+                        if(current64->hdr->cputype == CPU_TYPE_ARM64) {
+                            
+                            struct __darwin_arm_debug_state64 *debug = NULL;
+                            
+                            
+                        }
+                        else if(current64->hdr->cputype == CPU_TYPE_X86_64) {
+                            
+                            
+                            
+                        }
+                        
+                    }
+                    
                     cmdaddr = cmdaddr + proc.m64[i]->cmds[j]->cmdsize; // Move on to the next load command
                 }
                 
             }
+            
         }
         printf("\n");
     }
     
-    
-    
+    return err;
 }
 
 
@@ -826,6 +927,17 @@ void* GOTLookup(mach_port_t task, void *base, uint64_t value, uint64_t replacer)
     return NULL;
 }
 
+/*
+ * Example kernel-proclist-less logic for getting process name of a pid
+ * Works by just looking at the loaded images
+ * First image is by default the main binary
+*/
+char *procname(pid_t pid) {
+    MachoProc tgtproc = {};
+    tgtproc.pid = pid;
+    MachProcInit(tgtproc);
+    return tgtproc.m64[0]->imagePath;
+}
 
 /**
  * Macro for assuring that a framework is retrieved
@@ -901,10 +1013,19 @@ void my_hook(char *fmt, ...) {
 
 int main(int argc, char *argv[]) {
     
+    kern_return_t err = KERN_SUCCESS;
+    
     MachoProc ourProc = {};
     ourProc.task = MACH_PORT_NULL;
     ourProc.pid = atoi(argv[1]);
-    MachProcInit(ourProc);
+    
+    err = MachProcInit(ourProc);
+    
+    if(err != KERN_SUCCESS) {
+        return err;
+    }
+    
+    
     void* fwrkptr = NULL;
     void (*my_puts)(char *str);
     LOOKUP_FWRK("libsystem_c");
