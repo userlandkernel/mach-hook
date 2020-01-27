@@ -1,6 +1,6 @@
 /*
  * Copyright 2020 (c) Sem Voigtländer
- */
+*/
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,16 +42,36 @@ static inline struct dyld_all_image_infos* task_img_infos(task_t task) {
     
     struct dyld_all_image_infos* infos = NULL;
     
-    if(!MACH_PORT_VALID(task))
+    if(!MACH_PORT_VALID(task)) {
+        fprintf(stderr, "Invalid task.\n");
         return NULL;
+    }
 
     
     ret = task_info(task, TASK_DYLD_INFO, (task_info_t)&dyldInfo, &count);
-    if(ret != KERN_SUCCESS)
+    if(ret != KERN_SUCCESS) {
+        fprintf(stderr, "task_info failed: %s.\n", mach_error_string(ret));
         return NULL;
+    }
+
+    if(sizeof(struct dyld_all_image_infos) > dyldInfo.all_image_info_size) {
+        fprintf(stderr, "\tAll image info size mismatch.\n");
+        return NULL;
+    }
     
-    // Get image arrays, size and address
-    infos = (void*)dyldInfo.all_image_info_addr;
+    if(mach_task_self() == task) {
+        infos = (struct dyld_all_image_infos*)dyldInfo.all_image_info_addr;
+    }
+    else {
+        infos = malloc((size_t)dyldInfo.all_image_info_size);
+        mach_vm_size_t read = 0;
+        ret = mach_vm_read_overwrite(task, dyldInfo.all_image_info_addr, dyldInfo.all_image_info_size, (mach_vm_address_t)infos, &read);
+        if(ret != KERN_SUCCESS) {
+            fprintf(stderr, "\tfailed reading all image info from remote process: %s.\n", mach_error_string(ret));
+            infos = NULL;
+        }
+    }
+    
     
     return infos;
 }
@@ -75,49 +95,113 @@ static inline dyld_slide_t dyldSlide(void) {
     return g_dyldSlide;
 }
 
+kern_return_t mach_vm_strlen(task_t task, mach_vm_address_t address, mach_vm_size_t* len) {
+    kern_return_t ret = KERN_SUCCESS;
+    mach_vm_size_t read = 0;
+    char c = 'X';
+    while (c != '\0' && ret == KERN_SUCCESS) {
+        ret = mach_vm_read_overwrite(task, address, 1, (mach_vm_address_t)&c, &read);
+        len[0] = len[0] + 1;
+        address++;
+    }
+    return ret;
+}
+
+char* mach_vm_string(task_t task, char* remotePtr) {
+    kern_return_t ret = KERN_SUCCESS;
+    mach_vm_size_t read = 0;
+    mach_vm_size_t len = 0;
+    ret = mach_vm_strlen(task, (mach_vm_address_t)remotePtr, &len);
+    char *localstr = malloc((size_t)len);
+    bzero(localstr, (size_t)len);
+    ret = mach_vm_read_overwrite(task, (mach_vm_address_t)remotePtr, len, (mach_vm_address_t)localstr, &read);
+    if(ret != KERN_SUCCESS) {
+        if(localstr) {
+            free(localstr);
+            localstr = NULL;
+        }
+    }
+    return localstr;
+}
+
 static void MachProcInit(MachoProc proc) {
-    
+
     kern_return_t err = KERN_SUCCESS;
     struct dyld_all_image_infos* infos = NULL;
-    const struct dyld_image_info* image = NULL;
+    struct dyld_image_info* image = NULL;
+    Macho64* current64 = NULL;
+    Macho32* current32 = NULL;
     
     proc.m64 = NULL;
     proc.m32 = NULL;
     proc.name = NULL;
-    
+
     if(!MACH_PORT_VALID(proc.task)) {
         if(proc.pid == getpid()) {
             proc.task = mach_task_self();
         }
         else {
             err = task_for_pid(mach_task_self(), proc.pid, &proc.task);
-            if(err != KERN_SUCCESS)
+            if(err != KERN_SUCCESS) {
+                fprintf(stderr, "task_for_pid(%d) failed.\n", proc.pid);
                 return;
+            }
+            
         }
     }
-    
-    printf("MACH_PROC_INIT\n\n");
-    printf("pid: %d\n", proc.pid);
-    printf("task: %#x\n", proc.task);
-    
+
+    printf("MACH_PROC_INIT\n");
+    printf("\tpid: %d\n", proc.pid);
+    printf("\ttask: %#x\n", proc.task);
+
     infos = task_img_infos(proc.task);
+
+    if(!infos) {
+        fprintf(stderr, "task_img_infos(%#x) failed.\n", proc.task);
+    }
     
-    printf("count: %d images\n", infos->infoArrayCount);
-    
+    printf("\tcount: %d images\n", infos->infoArrayCount);
+
     // Allocate array with N references to Macho's
     proc.m64 = malloc(sizeof(Macho64*) * infos->infoArrayCount);
     proc.m32 = malloc(sizeof(Macho32*) * infos->infoArrayCount);
     
-    printf("images:\n");
+    
+    printf("\timages:\n\n");
     for(int i = 0; i < infos->infoArrayCount; ++i) {
         
         // Point to the next image
-        image = infos->infoArray + i;
+        if(proc.task == mach_task_self()) {
+            image = (struct dyld_image_info*)((unsigned long)infos->infoArray + i);
+        }
+        else {
+            mach_vm_size_t read = 0;
+            image = malloc(sizeof(struct dyld_image_info));
+            bzero(image, sizeof(struct dyld_image_info));
+            err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)(infos->infoArray + i), sizeof(struct dyld_image_info), (mach_vm_address_t)image, &read);
+            if(err != KERN_SUCCESS) {
+                fprintf(stderr, "\tfailed reading image info from remote process: %s.\n", mach_error_string(err));
+                free(image);
+                image = NULL;
+                return;
+            }
+        }
 
         // Optionally you can print the image path and modification date
         // That might be useful when you want to verify integrity of dynamic libraries
-        
-        printf("\t%d: %s @ %#llx (%s)\n", i, image->imageFilePath, (uint64_t)image->imageLoadAddress, proc.task == mach_task_self() ? "local" : "remote");
+        if(proc.task == mach_task_self()) {
+            printf("image #%d:\n\tPath: %s\n\tBase address: %#llx (local)\n", i, image->imageFilePath, (uint64_t)image->imageLoadAddress);
+        }
+        else {
+            char* imageFilePath = mach_vm_string(proc.task, (char*)image->imageFilePath);
+            if(!imageFilePath) {
+                printf("image #%d:\n\tPath: %s\n\tBase address: %#llx (remote)\n", i, "unknown", (uint64_t)image->imageLoadAddress);
+            } else {
+                printf("image #%d:\n\tPath: %s\n\tBase address: %#llx (remote)\n", i, imageFilePath, (uint64_t)image->imageLoadAddress);
+                free(imageFilePath); // FREE!!!
+                imageFilePath = NULL;
+            }
+        }
         
         // Allocate the actual objects
         proc.m64[i] = malloc(sizeof(Macho64));
@@ -129,14 +213,13 @@ static void MachProcInit(MachoProc proc) {
         
         if(proc.task == mach_task_self()) {
             
-            
             // Point the header to the image addresses
             proc.m64[i]->hdr = (struct mach_header_64*)image->imageLoadAddress;
             proc.m32[i]->hdr = (struct mach_header*)image->imageLoadAddress;
             
-            Macho64* current64 = proc.m64[i];
+            current64 = proc.m64[i];
             
-            printf("\tmagic: %#x\n", current64->hdr->magic);
+            printf("\t\tmagic: %#x\n", current64->hdr->magic);
             
             // Check the magic and wether it'd need to be swapped
             if(current64->hdr->magic == 0xfeedfacf || current64->hdr->magic == 0xfeedface) {
@@ -146,8 +229,65 @@ static void MachProcInit(MachoProc proc) {
                 current64->swap = false;
             }
             
-            // Now check whether its 64-bit or 32-bit
+            printf("\t\tendian: %s\n", current64->swap ? "little" : "big");
             
+            // Now check whether its 64-bit or 32-bit
+            if(current64->hdr->magic == 0xfeedfacf) {
+                
+                // Swap endianness if needed
+                if(current64->swap) {
+                    swap_mach_header_64(current64->hdr, 0);
+                }
+                
+                proc.m64[i]->cmds = malloc(proc.m64[i]->hdr->ncmds * sizeof(struct load_command*));
+                bzero(proc.m64[i]->cmds, proc.m64[i]->hdr->ncmds * sizeof(struct load_command*));
+                
+                struct symtab_command *symtab = NULL;
+                struct segment_command_64 *LINKEDIT = NULL, *TEXT = NULL, *DATA = NULL;
+                struct load_command* lc = (void*)proc.m64[i]->hdr + sizeof(struct mach_header_64);
+                
+                proc.m64[i]->segs = malloc(proc.m64[i]->hdr->ncmds * sizeof(struct segment_command_64*));
+                
+                for(int j = 0, k = 0; j < proc.m64[i]->hdr->ncmds; j++) {
+                    
+                    // Swap endianness if needed
+                    if(current64->swap) {
+                        swap_load_command(lc, 0);
+                    }
+                    
+                    
+                    // Check if it's a segment command
+                    if (lc->cmd == LC_SEGMENT_64) {
+                       
+                        proc.m64[i]->segs[k] = (struct segment_command_64*)lc;
+                        
+                        // Swap endianess if needed
+                        if(current64->swap) {
+                            swap_segment_command_64(proc.m64[i]->segs[k], 0);
+                        }
+                        
+                        printf("\t\tsegment: %s\n", proc.m64[i]->segs[k]->segname);
+                        printf("\t\tcount: %d sections.\n", proc.m64[i]->segs[k]->nsects);
+                        printf("\t\tregion: %#llx - %#llx / %#llx - %#llx prot: %d - %d\n", proc.m64[i]->segs[k]->fileoff, proc.m64[i]->segs[k]->fileoff + proc.m64[i]->segs[k]->filesize, proc.m64[i]->segs[k]->vmaddr, proc.m64[i]->segs[k]->vmaddr + proc.m64[i]->segs[k]->vmsize, proc.m64[i]->segs[k]->initprot, proc.m64[i]->segs[k]->maxprot);
+                        
+                        // Now go over the sections
+                        for(int l = 0; l < proc.m64[i]->segs[k]->nsects; l++) {
+                            
+                        }
+                        
+                        k++; // increment segment index counter
+                    }
+                    else if (lc->cmd == LC_SYMTAB) {
+                        symtab = (struct symtab_command*)lc;
+                        printf("\tsymtab\n");
+                        printf("\t\tcount: %d symbols.\n", symtab->nsyms);
+                        
+                    }
+                    proc.m64[i]->cmds[j] = lc;
+                    lc = (struct load_command *)((unsigned long)lc + lc->cmdsize);
+                }
+                
+            }
             
         }
         
@@ -161,7 +301,7 @@ static void MachProcInit(MachoProc proc) {
             mach_vm_size_t outSize = 0;
             
             // First the 32-bit one
-            err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)proc.m32[i]->hdr, sizeof(struct mach_header), (mach_vm_address_t)image->imageLoadAddress, &outSize);
+            err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)image->imageLoadAddress, sizeof(struct mach_header), (mach_vm_address_t)proc.m32[i]->hdr, &outSize);
             
             if(err != KERN_SUCCESS) {
                 // Optionally print error message
@@ -169,16 +309,16 @@ static void MachProcInit(MachoProc proc) {
             }
             
             // Then the 64-bit one
-            err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)proc.m64[i]->hdr, sizeof(struct mach_header_64), (mach_vm_address_t)image->imageLoadAddress, &outSize);
+            err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)image->imageLoadAddress, sizeof(struct mach_header_64), (mach_vm_address_t)proc.m64[i]->hdr, &outSize);
             
             if(err != KERN_SUCCESS) {
                 // Optionally print error message
                 return;
             }
             
-            Macho64* current64 = proc.m64[i];
+            current64 = proc.m64[i];
             
-            printf("\tmagic: %#x\n", current64->hdr->magic);
+            printf("\t\tmagic: %#x\n", current64->hdr->magic);
             
             // Check the magic and wether it'd need to be swapped
             if(current64->hdr->magic == MH_MAGIC_64 || current64->hdr->magic == MH_MAGIC) {
@@ -194,7 +334,7 @@ static void MachProcInit(MachoProc proc) {
                 // Lets say its safe to free and nullify the 32-bit version
                 free(proc.m32[i]->hdr);
                 proc.m32[i]->hdr = NULL;
-                bzero(&proc.m32[i], sizeof(Macho32));
+                bzero(proc.m32[i], sizeof(Macho32));
                 
                 // Swap endianness if needed
                 if(current64->swap) {
@@ -209,14 +349,14 @@ static void MachProcInit(MachoProc proc) {
                 
                 
                 // Zero out the pointers for security reasons
-                bzero(&proc.m64[i]->cmds, sizeof(struct load_command*) * current64->hdr->ncmds);
-                bzero(&proc.m64[i]->segs, sizeof(struct segment_command_64*) * current64->hdr->ncmds);
+                bzero(proc.m64[i]->cmds, sizeof(struct load_command*) * current64->hdr->ncmds);
+                bzero(proc.m64[i]->segs, sizeof(struct segment_command_64*) * current64->hdr->ncmds);
                 
                 // Point to the load commands in the remote process
                 mach_vm_address_t cmdaddr = (mach_vm_address_t)image->imageLoadAddress + sizeof(struct mach_header_64);
                
                 struct symtab_command *symtab = malloc(sizeof(struct symtab_command));
-                struct segment_command_64 *LINKEDIT = NULL, *TEXT = NULL, *DATA = NULL;
+                struct segment_command_64 *LINKEDIT = NULL, *TEXT = NULL, *TEXT_EXEC = NULL, *DATA = NULL;
                 
                 // Go over each load command
                 for(int j = 0, k = 0; j < current64->hdr->ncmds; j++) {
@@ -225,10 +365,10 @@ static void MachProcInit(MachoProc proc) {
                     bzero(proc.m64[i]->cmds[j], sizeof(struct load_command));
                     
                     // Copy the load command to our process
-                    err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)proc.m64[i]->cmds[j], sizeof(struct load_command), cmdaddr, &outSize);
+                    err = mach_vm_read_overwrite(proc.task, cmdaddr, sizeof(struct load_command), (mach_vm_address_t)proc.m64[i]->cmds[j], &outSize);
                     
                     if(err != KERN_SUCCESS) {
-                        // Optionally print error message
+                        fprintf(stderr, "Failed reading load command from remote process: %s\n", mach_error_string(err));
                         return;
                     }
                     
@@ -246,7 +386,7 @@ static void MachProcInit(MachoProc proc) {
                         
                         
                         // Copy the segment command to our process
-                        err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)proc.m64[i]->segs[k], sizeof(struct segment_command_64), cmdaddr, &outSize);
+                        err = mach_vm_read_overwrite(proc.task, cmdaddr, sizeof(struct segment_command_64), (mach_vm_address_t)proc.m64[i]->segs[k], &outSize);
                         
                         if(err != KERN_SUCCESS) {
                             // Optionally print error message
@@ -262,6 +402,20 @@ static void MachProcInit(MachoProc proc) {
                         printf("\t\tcount: %d sections.\n", proc.m64[i]->segs[k]->nsects);
                         printf("\t\t%#llx - %#llx / %#llx - %#llx prot: %d - %d\n", proc.m64[i]->segs[k]->fileoff, proc.m64[i]->segs[k]->fileoff + proc.m64[i]->segs[k]->filesize, proc.m64[i]->segs[k]->vmaddr, proc.m64[i]->segs[k]->vmaddr + proc.m64[i]->segs[k]->vmsize, proc.m64[i]->segs[k]->initprot, proc.m64[i]->segs[k]->maxprot);
                         
+                        
+                        if(string_compare("__DATA", proc.m64[i]->segs[k]->segname) == 0) {
+                            DATA = proc.m64[i]->segs[k];
+                        }
+                        else if(string_compare("__TEXT", proc.m64[i]->segs[k]->segname) == 0) {
+                            TEXT = proc.m64[i]->segs[k];
+                        }
+                        else if(string_compare("__LINKEDIT", proc.m64[i]->segs[k]->segname) == 0) {
+                            LINKEDIT = proc.m64[i]->segs[k];
+                        }
+                        else if(string_compare("__TEXT_EXEC", proc.m64[i]->segs[k]->segname) == 0) {
+                            TEXT_EXEC = proc.m64[i]->segs[k];
+                        }
+                        
                         // Now go over the sections
                         for(int l = 0; l < proc.m64[i]->segs[k]->nsects; l++) {
                             
@@ -273,30 +427,71 @@ static void MachProcInit(MachoProc proc) {
                     
                     else if (proc.m64[i]->cmds[j]->cmd == LC_SYMTAB) {
                         
-                        
-                        
                         bzero(symtab, sizeof(struct symtab_command));
                         
                         // Copy the symtab command to our process
-                        err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)symtab, sizeof(struct symtab_command), cmdaddr, &outSize);
+                        err = mach_vm_read_overwrite(proc.task, cmdaddr, sizeof(struct symtab_command), (mach_vm_address_t)symtab, &outSize);
                         
                         if(err != KERN_SUCCESS) {
                             // Optionally print error message
                             return;
                         }
                         
-                        printf("\tsymtab\n");
+                        printf("\tsymtab:\n");
                         printf("\t\tcount: %d symbols.\n", symtab->nsyms);
                         
+                        // These segments are required to calculate the file slide
+                        if (!LINKEDIT || !symtab || !TEXT) {
+                            fprintf(stderr, "\t\tFailed to retrieve required segments for remote process\n");
+                            continue;
+                        }
                         
+                        
+                        mach_vm_address_t base = (mach_vm_address_t)image->imageLoadAddress;
+                        
+                        // Calculate the file slide
+                        unsigned long fileSlide = (unsigned long)(LINKEDIT->vmaddr - TEXT->vmaddr - LINKEDIT->fileoff);
+                        printf("\t\tfile slide: %#lx\n", fileSlide);
+                        
+                        // Calculate the string table offset
+                        char* strtab = (char *)(base + fileSlide + symtab->stroff);
+                        printf("\t\tstrtab addr: %#lx\n", (unsigned long)strtab);
+                        
+                        // Calculate the offset of and point to the first name list
+                        struct nlist_64* nl = malloc(sizeof(struct nlist_64) * symtab->nsyms);
+                        bzero(nl, sizeof(struct nlist_64));
+                        mach_vm_size_t read = 0;
+                        err = mach_vm_read_overwrite(proc.task, (mach_vm_address_t)(base + fileSlide + symtab->symoff), sizeof(struct nlist_64) * symtab->nsyms, (mach_vm_address_t)nl, &read);
+                        
+                        if(err != KERN_SUCCESS) {
+                            fprintf(stderr, "\t\tFailed to get nlist from remote process: %s\n", mach_error_string(err));
+                            if(nl) {
+                                free(nl);
+                                nl = NULL;
+                            }
+                            continue;
+                        }
+                        
+                        printf("\t\tsymbols:\n");
+                        // Walk over the namelists in the symbol table
+                        for (int i=0; i < symtab->nsyms; i++) {
+                            
+                            // Retrieve the name / string in the current name list
+                            char *namePtr = strtab + nl[i].n_un.n_strx;
+                            char* name = mach_vm_string(proc.task, namePtr);
+                            if(!name || !nl[i].n_value) {
+                                continue;
+                            }
+                           printf("\t\t\t#define %s %#llx\n", name, nl[i].n_value + g_dyldSlide);
+                        }
                     }
                     
-                    cmdaddr += proc.m64[i]->cmds[j]->cmdsize; // Move on to the next load command
+                    cmdaddr = cmdaddr + proc.m64[i]->cmds[j]->cmdsize; // Move on to the next load command
                 }
                 
             }
         }
-        
+        printf("\n");
     }
     
     
@@ -606,7 +801,7 @@ void* GOTLookup(mach_port_t task, void *base, uint64_t value, uint64_t replacer)
         }
         
         printf("__DATA.%s @ %#llx\n", sec->sectname, sec->addr);
-        for(int i = 0; i < got->size; i+=sizeof(uint64_t)) {
+        for(int i = 0; i < got->size; i += sizeof(uint64_t)) {
             uint64_t* valPtr = (void*)(got->addr + i);
             if(*valPtr == value) {
                 if(replacer != value) {
@@ -706,13 +901,17 @@ void my_hook(char *fmt, ...) {
 
 int main(int argc, char *argv[]) {
     
+    MachoProc ourProc = {};
+    ourProc.task = MACH_PORT_NULL;
+    ourProc.pid = atoi(argv[1]);
+    MachProcInit(ourProc);
     void* fwrkptr = NULL;
     void (*my_puts)(char *str);
     LOOKUP_FWRK("libsystem_c");
     LINK_SYM(my_puts, "_puts");
     GOTLookup(mach_task_self(), fwrkptr, 0x7fff742a4680, 0x4141414141);
     //	my_puts("Hello world from my_puts!\n");
-    PatchSym(mach_task_self(), fwrkptr, "_puts", (uint64_t)my_hook);
+//    PatchSym(mach_task_self(), fwrkptr, "_puts", (uint64_t)my_hook);
     puts("If you can read this then puts did not get hooked!\n");
     
     return 0;
