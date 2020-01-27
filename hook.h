@@ -1,13 +1,13 @@
 //
-//  exploit.h
+//  hook.h
 //  watchme
 //
 //  Created by Sem Voigtländer on 16/01/20.
 //  Copyright © 2020 kernelprogrammer. All rights reserved.
 //
 
-#ifndef exploit_h
-#define exploit_h
+#ifndef hook_h
+#define hook_h
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -77,4 +77,4 @@ typedef mach_vm_address_t uaddr_t;
 extern kern_return_t mach_vm_protect(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection);
 extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task, mach_vm_address_t address, mach_vm_size_t size, mach_vm_address_t data, mach_vm_size_t *outsize);
 
-#endif /* exploit_h */
+#endif /* hook_h */
