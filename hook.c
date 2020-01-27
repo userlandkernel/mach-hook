@@ -18,7 +18,7 @@
 
 #include <mach/mach.h>
 
-#include "exploit.h"
+#include "hook.h"
 
 dyld_slide_t g_dyldSlide = 0;
 
